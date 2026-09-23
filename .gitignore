@@ -1,0 +1,19 @@
+# Python environment
+.venv/
+__pycache__/
+*.pyc
+
+# Datasets (never commit raw or processed images)
+data/
+data_raw/
+
+# Model checkpoints
+*.pt
+*.pth
+
+# OS/editor cruft
+.DS_Store
+Thumbs.db
+
+# Local Claude Code project instructions (kept local, not published)
+CLAUDE.md
