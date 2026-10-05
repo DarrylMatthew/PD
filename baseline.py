@@ -1,12 +1,15 @@
 import argparse
+import csv
 import random
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
 from PIL import Image
-from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+from sklearn.metrics import (accuracy_score, balanced_accuracy_score, confusion_matrix,
+                             f1_score, roc_auc_score)
 from sklearn.model_selection import StratifiedGroupKFold
 from torch.utils.data import DataLoader, Dataset
 from torchvision import models, transforms
@@ -99,16 +102,42 @@ def run_epoch(model, loader, device, optimizer=None):
     probs = torch.cat(probs).numpy()
     ys = torch.cat(ys).numpy()
     preds = (probs >= 0.5).astype(int)
+    tn, fp, fn, tp = confusion_matrix(ys, preds, labels=[0, 1]).ravel()
     return {
         "loss": total_loss / len(ys),
         "acc": accuracy_score(ys, preds),
+        "bal_acc": balanced_accuracy_score(ys, preds),
         "f1": f1_score(ys, preds, zero_division=0),
         "auc": roc_auc_score(ys, probs) if len(set(ys)) > 1 else float("nan"),
+        "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp),
     }
 
 
+RESULT_FIELDS = ["time", "tag", "train_dataset", "eval_dataset", "eval_type", "seed", "epochs",
+                 "acc", "bal_acc", "f1", "auc", "tn", "fp", "fn", "tp"]
+
+
 def report(name, m):
-    print(f"{name:30s} acc {m['acc']:.3f} | f1 {m['f1']:.3f} | auc {m['auc']:.3f}")
+    print(f"{name:30s} acc {m['acc']:.3f} | bal_acc {m['bal_acc']:.3f} | f1 {m['f1']:.3f} "
+          f"| auc {m['auc']:.3f} | tn/fp/fn/tp {m['tn']}/{m['fp']}/{m['fn']}/{m['tp']}")
+
+
+def log_result(csv_path, args, tag, eval_dataset, eval_type, m):
+    if not csv_path:
+        return
+    path = Path(csv_path)
+    new_file = not path.exists()
+    with open(path, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=RESULT_FIELDS)
+        if new_file:
+            w.writeheader()
+        w.writerow({
+            "time": datetime.now().isoformat(timespec="seconds"), "tag": tag,
+            "train_dataset": args.train_dataset, "eval_dataset": eval_dataset,
+            "eval_type": eval_type, "seed": args.seed, "epochs": args.epochs,
+            **{k: (round(m[k], 4) if isinstance(m[k], float) else m[k])
+               for k in RESULT_FIELDS[7:]},
+        })
 
 
 def main():
@@ -120,8 +149,11 @@ def main():
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--results-csv", default=None, help="append one row per evaluation to this CSV")
+    ap.add_argument("--ckpt-dir", default="checkpoints")
     args = ap.parse_args()
 
+    tag = Path(args.data_root).name
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("Device:", device)
@@ -141,7 +173,8 @@ def main():
 
     model = build_model().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    ckpt = f"best_{args.train_dataset}.pt"
+    Path(args.ckpt_dir).mkdir(exist_ok=True)
+    ckpt = str(Path(args.ckpt_dir) / f"{tag}_{args.train_dataset}_s{args.seed}.pt")
     best_f1 = -1.0
 
     for ep in range(1, args.epochs + 1):
@@ -155,10 +188,14 @@ def main():
 
     model.load_state_dict(torch.load(ckpt, map_location=device))
     print("\n== Results ==")
-    report(f"in-domain ({args.train_dataset})", run_epoch(model, test_dl, device))
+    m = run_epoch(model, test_dl, device)
+    report(f"in-domain ({args.train_dataset})", m)
+    log_result(args.results_csv, args, tag, args.train_dataset, "in-domain", m)
     for name in args.test_datasets:
         cross = collect_samples(args.data_root, name)
-        report(f"cross-dataset ({name})", run_epoch(model, make_loader(cross, eval_tf, False), device))
+        m = run_epoch(model, make_loader(cross, eval_tf, False), device)
+        report(f"cross-dataset ({name})", m)
+        log_result(args.results_csv, args, tag, name, "cross-dataset", m)
 
 
 if __name__ == "__main__":
